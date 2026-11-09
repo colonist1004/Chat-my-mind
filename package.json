@@ -1,0 +1,19 @@
+{
+  "name": "chat-my-mind",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "나만의 캐릭터를 만들고 대화하는 AI 캐릭터 채팅 (모바일/PC PWA)",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview --host"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
+    "idb-keyval": "^6.3.0"
+  },
+  "devDependencies": {
+    "vite": "^8.3.6"
+  }
+}
