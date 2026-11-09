@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
 import { db, uid, tx } from "./db.js";
 import { COOKIE, hashPassword, verifyPassword, createSession, cookieOptions, requireUser, limitAttempts } from "./auth.js";
-import { streamReply, friendlyError, MODELS, ALLOWED_MODELS, DEFAULT_MODEL, Anthropic } from "./ai.js";
+import { streamReply, suggestCharacter, friendlyError, MODELS, ALLOWED_MODELS, DEFAULT_MODEL, Anthropic } from "./ai.js";
 import { fill } from "./prompt.js";
 
 const PORT = Number(process.env.PORT) || 8787;
@@ -25,8 +25,31 @@ const now = () => Date.now();
 const today = () => new Date().toISOString().slice(0, 10);
 const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
 
-const DEFAULT_SETTINGS = { model: DEFAULT_MODEL, effort: "medium", length: "보통", maxTokens: 4000, userName: "나", userPersona: "" };
-const userSettings = (u) => ({ ...DEFAULT_SETTINGS, ...u.settings });
+const DEFAULT_SETTINGS = { model: DEFAULT_MODEL, effort: "medium", length: "보통", maxTokens: 4000 };
+const MAX_PERSONAS = 8;
+
+// 내 프로필(페르소나) 목록. 예전 형식(userName/userPersona 하나)은 첫 프로필로 옮깁니다.
+function userSettings(u) {
+  const s = { ...DEFAULT_SETTINGS, ...u.settings };
+  if (!Array.isArray(s.personas) || !s.personas.length) {
+    s.personas = [{ id: "p1", name: s.userName || u.username, description: s.userPersona || "", emoji: "🙂" }];
+  }
+  delete s.userPersona;
+  s.userName = s.personas[0].name; // {{user}} 기본값 = 대표 프로필
+  return s;
+}
+function cleanPersonas(list, fallbackName) {
+  const out = [];
+  const seen = new Set();
+  for (const p of Array.isArray(list) ? list.slice(0, MAX_PERSONAS) : []) {
+    const name = str(p?.name, 40).trim();
+    if (!name) continue;
+    let id = /^[\w-]{1,24}$/.test(p.id) && !seen.has(p.id) ? p.id : "p" + uid().slice(-8);
+    seen.add(id);
+    out.push({ id, name, description: str(p.description, 4000), emoji: str(p.emoji, 8) || "🙂" });
+  }
+  return out.length ? out : [{ id: "p1", name: fallbackName, description: "", emoji: "🙂" }];
+}
 
 const str = (v, max) => (typeof v === "string" ? v.slice(0, max) : "");
 function cleanCharacter(input) {
@@ -54,17 +77,19 @@ function getOwnedChat(userId, id) {
   return db.prepare("SELECT * FROM chats WHERE id = ? AND user_id = ?").get(id, userId);
 }
 function chatMessages(chatId) {
-  return db.prepare("SELECT id, role, text, created_at AS at FROM messages WHERE chat_id = ? ORDER BY seq").all(chatId);
+  return db.prepare("SELECT id, role, text, speaker, created_at AS at FROM messages WHERE chat_id = ? ORDER BY seq").all(chatId);
 }
-function addMessage(chatId, role, text) {
+function addMessage(chatId, role, text, speaker = null) {
   const { m } = db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE chat_id = ?").get(chatId);
-  const msg = { id: uid(), role, text, at: now() };
-  db.prepare("INSERT INTO messages (id, chat_id, seq, role, text, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(msg.id, chatId, m + 1, role, text, msg.at);
+  const msg = { id: uid(), role, text, speaker, at: now() };
+  db.prepare("INSERT INTO messages (id, chat_id, seq, role, text, speaker, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+    msg.id, chatId, m + 1, role, text, speaker, msg.at,
+  );
   db.prepare("UPDATE chats SET updated_at = ? WHERE id = ?").run(msg.at, chatId);
   return msg;
 }
 function chatJSON(c) {
-  return { id: c.id, charId: c.char_id, title: c.title, note: c.note, createdAt: c.created_at, updatedAt: c.updated_at };
+  return { id: c.id, charId: c.char_id, title: c.title, note: c.note, personaId: c.persona_id, createdAt: c.created_at, updatedAt: c.updated_at };
 }
 function createChat(userId, char, settings) {
   const id = uid();
@@ -93,7 +118,7 @@ api.post("/auth/register", limitAttempts(), (req, res) => {
     id,
     username,
     hashPassword(password),
-    JSON.stringify({ userName: username }),
+    JSON.stringify({ personas: [{ id: "p1", name: username, description: "", emoji: "🙂" }] }),
     isFirst ? 1 : 0, // 첫 가입자는 관리자(사용량 무제한)
     now(),
   );
@@ -142,11 +167,10 @@ api.put("/settings", (req, res) => {
     effort: ["low", "medium", "high"].includes(b.effort) ? b.effort : "medium",
     length: ["짧게", "보통", "길게"].includes(b.length) ? b.length : "보통",
     maxTokens: Math.min(Math.max(Number(b.maxTokens) || 4000, 500), 32000),
-    userName: str(b.userName, 40).trim() || req.user.username,
-    userPersona: str(b.userPersona, 4000),
+    personas: cleanPersonas(b.personas, req.user.username),
   };
   db.prepare("UPDATE users SET settings = ? WHERE id = ?").run(JSON.stringify(s), req.user.id);
-  res.json(s);
+  res.json(userSettings({ ...req.user, settings: s }));
 });
 
 // ---------- 캐릭터 ----------
@@ -277,18 +301,30 @@ api.post("/chats/:id/reply", async (req, res) => {
 
   const settings = userSettings(req.user);
   const text = str(req.body.text, 20000).trim();
+  // 이번 메시지를 보낼 내 프로필 (멀티 프로필 모드)
+  const persona = settings.personas.find((p) => p.id === req.body.personaId) || settings.personas.find((p) => p.id === chat.persona_id) || settings.personas[0];
   let userMsg = null;
   if (req.body.regenerate) {
     const last = db.prepare("SELECT id, role FROM messages WHERE chat_id = ? ORDER BY seq DESC LIMIT 1").get(chat.id);
     if (last?.role === "assistant") db.prepare("DELETE FROM messages WHERE id = ?").run(last.id);
   } else {
     if (!text) return bad(res, "메시지를 입력하세요.");
-    userMsg = addMessage(chat.id, "user", text);
+    userMsg = addMessage(chat.id, "user", text, persona.id);
     if (!chat.title) db.prepare("UPDATE chats SET title = ? WHERE id = ?").run(text.slice(0, 30), chat.id);
   }
+  db.prepare("UPDATE chats SET persona_id = ? WHERE id = ?").run(persona.id, chat.id);
 
   const history = chatMessages(chat.id);
   if (!history.some((m) => m.role === "user")) return bad(res, "먼저 메시지를 보내 주세요.");
+
+  // 대화에 참여한 프로필들 (처음 말한 순서). 예전 메시지(speaker 없음)는 대표 프로필로 봅니다.
+  const byId = new Map(settings.personas.map((p) => [p.id, p]));
+  const personas = [];
+  for (const m of history) {
+    if (m.role !== "user") continue;
+    const p = byId.get(m.speaker) || settings.personas[0];
+    if (!personas.includes(p)) personas.push(p);
+  }
 
   busy.add(chat.id);
   res.writeHead(200, {
@@ -300,7 +336,7 @@ api.post("/chats/:id/reply", async (req, res) => {
   const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
   if (userMsg) send({ type: "user", message: userMsg });
 
-  const gen = streamReply({ char, chat, settings, history, onText: (t) => send({ type: "delta", text: t }) });
+  const gen = streamReply({ char, chat, settings, personas, history, onText: (t) => send({ type: "delta", text: t }) });
   let finished = false;
   res.on("close", () => {
     if (!finished) gen.abort(); // 사용자가 멈추기를 누르거나 연결이 끊김
@@ -332,6 +368,23 @@ api.post("/chats/:id/reply", async (req, res) => {
   }
 });
 
+// ---------- 제목으로 캐릭터 자동 작성 ----------
+api.post("/characters/suggest", async (req, res) => {
+  const title = str(req.body.title, 60).trim();
+  const hint = str(req.body.hint, 500).trim();
+  if (!title) return bad(res, "제목(이름)을 먼저 입력하세요.");
+  if (!checkQuota(req.user)) return bad(res, `오늘 사용 가능한 횟수(${DAILY_LIMIT}회)를 모두 썼습니다.`, 429);
+  try {
+    const r = await suggestCharacter({ title, hint, settings: userSettings(req.user) });
+    recordUsage(req.user.id, r.usage);
+    if (r.refused || !r.fields) return bad(res, "이 제목으로는 자동 작성을 할 수 없어요. 제목이나 힌트를 바꿔 보세요.", 422);
+    res.json(cleanCharacter({ ...r.fields, name: title }));
+  } catch (e) {
+    console.error("[suggest]", e);
+    bad(res, friendlyError(e), 502);
+  }
+});
+
 // ---------- 백업 ----------
 api.get("/export", (req, res) => {
   const chars = db.prepare("SELECT * FROM characters WHERE user_id = ?").all(req.user.id);
@@ -344,7 +397,7 @@ api.get("/export", (req, res) => {
       ...JSON.parse(c.data),
       chats: chats
         .filter((ch) => ch.char_id === c.id)
-        .map((ch) => ({ title: ch.title, note: ch.note, messages: chatMessages(ch.id).map(({ role, text, at }) => ({ role, text, at })) })),
+        .map((ch) => ({ title: ch.title, note: ch.note, messages: chatMessages(ch.id).map(({ role, text, speaker, at }) => ({ role, text, speaker, at })) })),
     })),
   });
 });
@@ -368,8 +421,8 @@ api.post("/import", (req, res) => {
         let seq = 0;
         for (const m of Array.isArray(ch.messages) ? ch.messages : []) {
           if (!["user", "assistant"].includes(m.role) || !m.text) continue;
-          db.prepare("INSERT INTO messages (id, chat_id, seq, role, text, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(
-            uid(), chatId, ++seq, m.role, str(m.text, 20000), Number(m.at) || t,
+          db.prepare("INSERT INTO messages (id, chat_id, seq, role, text, speaker, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+            uid(), chatId, ++seq, m.role, str(m.text, 20000), typeof m.speaker === "string" ? m.speaker.slice(0, 24) : null, Number(m.at) || t,
           );
         }
       }

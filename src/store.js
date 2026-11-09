@@ -37,6 +37,7 @@ export const api = {
   createCharacter: (c) => call("POST", "/characters", c),
   updateCharacter: (id, c) => call("PUT", "/characters/" + id, c),
   deleteCharacter: (id) => call("DELETE", "/characters/" + id),
+  suggestCharacter: (b) => call("POST", "/characters/suggest", b),
 
   listChats: (charId) => call("GET", `/characters/${charId}/chats`),
   newChat: (charId) => call("POST", `/characters/${charId}/chats`),

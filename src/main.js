@@ -34,6 +34,19 @@ function toast(msg) {
 
 const go = (hash) => (location.hash = hash);
 
+// 내 프로필별 말풍선 색
+const PERSONA_COLORS = [
+  "linear-gradient(135deg, #ff6b4a, #e2489a)",
+  "linear-gradient(135deg, #3b82f6, #6d5cf6)",
+  "linear-gradient(135deg, #10b981, #0e9fa8)",
+  "linear-gradient(135deg, #f59e0b, #e8663a)",
+  "linear-gradient(135deg, #a855f7, #db2777)",
+  "linear-gradient(135deg, #64748b, #334155)",
+  "linear-gradient(135deg, #ec4899, #f43f5e)",
+  "linear-gradient(135deg, #14b8a6, #3b82f6)",
+];
+const personaColor = (i) => PERSONA_COLORS[(i < 0 ? 0 : i) % PERSONA_COLORS.length];
+
 // 이미지를 정사각형 256px JPEG 로 줄여 용량을 아낍니다.
 function resizeImage(file, size = 256) {
   return new Promise((resolve, reject) => {
@@ -207,9 +220,20 @@ const FIELDS = [
   ["examples", "예시 대화 (선택)", "textarea", "{{user}}: 안녕?\n{{char}}: *고개만 까딱인다* …응."],
 ];
 
+const fieldHTML = ([k, label, type, ph, req], _i, _a, c = editing) => `
+  <label class="field"><span>${label}${req ? " *" : ""}</span>
+    ${
+      type === "input"
+        ? `<input name="${k}" value="${esc(c[k])}" placeholder="${esc(ph)}" ${req ? "required" : ""}>`
+        : `<textarea name="${k}" rows="${k === "examples" ? 5 : 3}" placeholder="${esc(ph)}">${esc(c[k])}</textarea>`
+    }
+  </label>`;
+let editing = {};
+
 async function viewEdit(id) {
   const isNew = !id;
   const c = isNew ? { emoji: "🙂", tags: [] } : await api.getCharacter(id);
+  editing = c;
 
   const main = await shell(
     `
@@ -229,16 +253,15 @@ async function viewEdit(id) {
             <label class="inline">이모지 <input name="emoji" maxlength="4" value="${esc(c.emoji)}" class="emoji-input"></label>
           </div>
         </div>
-        ${FIELDS.map(
-          ([k, label, type, ph, req]) => `
-          <label class="field"><span>${label}${req ? " *" : ""}</span>
-            ${
-              type === "input"
-                ? `<input name="${k}" value="${esc(c[k])}" placeholder="${esc(ph)}" ${req ? "required" : ""}>`
-                : `<textarea name="${k}" rows="${k === "examples" ? 5 : 3}" placeholder="${esc(ph)}">${esc(c[k])}</textarea>`
-            }
-          </label>`,
-        ).join("")}
+        ${fieldHTML(FIELDS[0])}
+        <div class="suggest-box">
+          <div class="suggest-head"><b>✨ 제목으로 자동 작성</b><span class="hint">위 이름(제목)을 보고 AI가 나머지 설정을 채워 줘요</span></div>
+          <div class="suggest-row">
+            <input id="suggestHint" maxlength="500" placeholder="(선택) 원하는 분위기·설정 힌트 예) 학원물, 코믹, 반말">
+            <button type="button" class="btn primary" id="suggest">자동 작성</button>
+          </div>
+        </div>
+        ${FIELDS.slice(1).map(fieldHTML).join("")}
         <label class="field"><span>태그 (쉼표로 구분)</span>
           <input name="tags" value="${esc((c.tags || []).join(", "))}" placeholder="예) 로맨스, 일상, 츤데레">
         </label>
@@ -272,6 +295,37 @@ async function viewEdit(id) {
   main.querySelector("#clearImg").addEventListener("click", () => {
     avatar = "";
     refreshPreview();
+  });
+
+  // 제목 기반 자동 작성
+  main.querySelector("#suggest").addEventListener("click", async (e) => {
+    const title = form.name.value.trim();
+    if (!title) {
+      form.name.focus();
+      return toast("먼저 이름(제목)을 입력하세요.");
+    }
+    const filled = FIELDS.slice(1).some(([k]) => form[k].value.trim());
+    if (filled && !confirm("이미 적은 내용을 AI가 작성한 내용으로 바꿀까요?")) return;
+    const btn = e.target;
+    btn.disabled = true;
+    btn.textContent = "작성 중…";
+    main.querySelector(".suggest-box").classList.add("loading");
+    try {
+      const r = await api.suggestCharacter({ title, hint: main.querySelector("#suggestHint").value });
+      for (const [k] of FIELDS.slice(1)) if (r[k] !== undefined) form[k].value = r[k];
+      form.tags.value = (r.tags || []).join(", ");
+      if (!avatar && r.emoji) {
+        form.emoji.value = r.emoji;
+        refreshPreview();
+      }
+      toast("자동 작성했어요. 마음에 들게 고친 뒤 저장하세요.");
+    } catch (err) {
+      toast(err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "자동 작성";
+      main.querySelector(".suggest-box").classList.remove("loading");
+    }
   });
 
   const collect = () => {
@@ -331,6 +385,10 @@ async function viewChat(charId, chatId) {
     </header>
     <div class="scroll messages" id="msgs"></div>
     <form class="composer" id="composer">
+      <div class="persona-pick">
+        <button type="button" class="persona-btn" id="personaBtn" title="말할 프로필 바꾸기"></button>
+        <div class="menu persona-menu" id="personaMenu" hidden></div>
+      </div>
       <textarea id="input" rows="1" placeholder="메시지 입력 · *행동*은 별표"></textarea>
       <button class="send" id="send" type="submit" title="보내기">➤</button>
     </form>`,
@@ -341,6 +399,52 @@ async function viewChat(charId, chatId) {
   const input = main.querySelector("#input");
   const sendBtn = main.querySelector("#send");
   const menu = main.querySelector("#menu");
+
+  // ---- 멀티 프로필: 지금 말하는 내 프로필 ----
+  const personas = me.settings.personas;
+  const multi = personas.length > 1;
+  let personaId = personas.some((p) => p.id === chat.personaId) ? chat.personaId : personas[0].id;
+  const personaIndex = (id) => Math.max(0, personas.findIndex((p) => p.id === id));
+  const personaBtn = main.querySelector("#personaBtn");
+  const personaMenu = main.querySelector("#personaMenu");
+  function renderPersonaPick() {
+    const i = personaIndex(personaId);
+    const p = personas[i];
+    personaBtn.innerHTML = `<span class="pb-emoji">${esc(p.emoji || "🙂")}</span>${multi ? `<span class="pb-name">${esc(p.name)}</span>` : ""}`;
+    personaBtn.style.setProperty("--pc", personaColor(i));
+    input.placeholder = multi ? `${p.name}(으)로 말하기` : "메시지 입력 · *행동*은 별표";
+    personaMenu.innerHTML =
+      personas
+        .map(
+          (x, j) => `<button type="button" data-pid="${esc(x.id)}" class="${x.id === personaId ? "on" : ""}">
+            <span class="dot" style="background:${personaColor(j)}"></span>${esc(x.emoji || "🙂")} ${esc(x.name)}</button>`,
+        )
+        .join("") + `<button type="button" data-pid="__settings">⚙️ 프로필 관리</button>`;
+  }
+  personaBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (!multi) return toast("설정에서 프로필을 추가하면 여러 사람으로 대화할 수 있어요.");
+    personaMenu.hidden = !personaMenu.hidden;
+  });
+  personaMenu.addEventListener("click", (e) => {
+    const pid = e.target.closest("button")?.dataset.pid;
+    personaMenu.hidden = true;
+    if (pid === "__settings") return go("#/settings");
+    if (pid) {
+      personaId = pid;
+      renderPersonaPick();
+      input.focus();
+    }
+  });
+  // Alt+숫자 로 빠르게 전환 (PC)
+  input.addEventListener("keydown", (e) => {
+    if (e.altKey && /^[1-8]$/.test(e.key) && personas[e.key - 1]) {
+      e.preventDefault();
+      personaId = personas[e.key - 1].id;
+      renderPersonaPick();
+    }
+  });
+  renderPersonaPick();
 
   const atBottom = () => msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 80;
   const scrollDown = () => (msgsEl.scrollTop = msgsEl.scrollHeight);
@@ -354,7 +458,8 @@ async function viewChat(charId, chatId) {
         ${m.role === "assistant" ? avatarHTML(c, "xs") : ""}
         <div class="bubble-wrap">
           ${m.role === "assistant" ? `<div class="who">${esc(c.name)}</div>` : ""}
-          <div class="bubble ${m.error ? "error" : ""}">${m.text ? renderText(m.text) : '<span class="typing"><i></i><i></i><i></i></span>'}</div>
+          ${m.role === "user" && multi ? `<div class="who">${esc(personas[personaIndex(m.speaker)].emoji || "")} ${esc(personas[personaIndex(m.speaker)].name)}</div>` : ""}
+          <div class="bubble ${m.error ? "error" : ""}" ${m.role === "user" ? `style="--pc:${personaColor(personaIndex(m.speaker))}"` : ""}>${m.text ? renderText(m.text) : '<span class="typing"><i></i><i></i><i></i></span>'}</div>
           <div class="msg-actions">
             ${canRegen ? `<button data-act="regen" title="다시 생성">↻ 다시</button>` : ""}
             ${saved ? `<button data-act="edit" title="수정">✎ 수정</button><button data-act="del" title="삭제">✕ 삭제</button>` : ""}
@@ -432,7 +537,7 @@ async function viewChat(charId, chatId) {
     if (!text) return;
     input.value = "";
     autosize();
-    generate({ text }, { role: "user", text });
+    generate({ text, personaId }, { role: "user", text, speaker: personaId });
   });
 
   // PC: Enter 전송, Shift+Enter 줄바꿈 / 모바일: 엔터는 줄바꿈, 버튼으로 전송
@@ -495,7 +600,10 @@ async function viewChat(charId, chatId) {
     e.stopPropagation();
     menu.hidden = !menu.hidden;
   });
-  main.addEventListener("click", () => (menu.hidden = true));
+  main.addEventListener("click", () => {
+    menu.hidden = true;
+    personaMenu.hidden = true;
+  });
   menu.addEventListener("click", async (e) => {
     const act = e.target.closest("button")?.dataset.act;
     menu.hidden = true;
@@ -625,10 +733,9 @@ async function viewSettings() {
         </label>
 
         <h3>내 프로필 (페르소나)</h3>
-        <label class="field"><span>내 이름</span><input name="userName" value="${esc(s.userName)}" placeholder="캐릭터가 부를 이름"></label>
-        <label class="field"><span>나에 대한 설명</span>
-          <textarea name="userPersona" rows="3" placeholder="예) 25살 직장인. 겁이 많지만 호기심이 강하다.">${esc(s.userPersona)}</textarea>
-        </label>
+        <p class="hint">프로필을 여러 개 만들어 두면 채팅 중 입력창 왼쪽 버튼으로 바꿔 가며 한 대화에서 여러 사람으로 말할 수 있어요. 맨 위 프로필이 기본이에요.</p>
+        <div id="personas" class="personas"></div>
+        <button type="button" class="btn" id="addPersona">＋ 프로필 추가</button>
 
         <h3>데이터</h3>
         <p class="hint">캐릭터와 대화는 서버에 저장되어 어느 기기에서 로그인해도 이어서 볼 수 있어요.</p>
@@ -642,15 +749,59 @@ async function viewSettings() {
   );
 
   const form = main.querySelector("#form");
+
+  // 프로필 목록 편집
+  let personas = s.personas.map((p) => ({ ...p }));
+  const listEl = main.querySelector("#personas");
+  const readPersonas = () =>
+    listEl.querySelectorAll(".persona-row").forEach((row, i) => {
+      personas[i].emoji = row.querySelector("[data-f=emoji]").value;
+      personas[i].name = row.querySelector("[data-f=name]").value;
+      personas[i].description = row.querySelector("[data-f=description]").value;
+    });
+  const renderPersonas = () => {
+    listEl.innerHTML = personas
+      .map(
+        (p, i) => `
+        <div class="persona-row" style="--pc:${personaColor(i)}">
+          <div class="persona-head">
+            <input data-f="emoji" class="emoji-input" maxlength="4" value="${esc(p.emoji || "🙂")}">
+            <input data-f="name" value="${esc(p.name)}" placeholder="이름 (캐릭터가 부를 이름)">
+            ${i === 0 ? '<i class="badge">기본</i>' : `<button type="button" class="icon-btn" data-up="${i}" title="기본으로">⬆</button>`}
+            ${personas.length > 1 ? `<button type="button" class="icon-btn" data-del="${i}" title="삭제">✕</button>` : ""}
+          </div>
+          <textarea data-f="description" rows="2" placeholder="이 프로필 설명 (예: 25살 직장인. 겁이 많지만 호기심이 강하다.)">${esc(p.description)}</textarea>
+        </div>`,
+      )
+      .join("");
+    main.querySelector("#addPersona").hidden = personas.length >= 8;
+  };
+  renderPersonas();
+  listEl.addEventListener("click", (e) => {
+    const up = e.target.closest("[data-up]")?.dataset.up;
+    const del = e.target.closest("[data-del]")?.dataset.del;
+    if (up === undefined && del === undefined) return;
+    readPersonas();
+    if (up !== undefined) personas.unshift(...personas.splice(Number(up), 1));
+    if (del !== undefined) personas.splice(Number(del), 1);
+    renderPersonas();
+  });
+  main.querySelector("#addPersona").addEventListener("click", () => {
+    readPersonas();
+    personas.push({ id: "", name: "", description: "", emoji: "🙂" });
+    renderPersonas();
+    listEl.querySelector(".persona-row:last-child [data-f=name]").focus();
+  });
+
   main.querySelector("#save").addEventListener("click", async () => {
+    readPersonas();
     try {
       me.settings = await api.saveSettings({
         model: form.model.value,
         effort: form.effort.value,
         length: form.length.value,
         maxTokens: Number(form.maxTokens.value),
-        userName: form.userName.value,
-        userPersona: form.userPersona.value,
+        personas: personas.filter((p) => p.name.trim()),
       });
       toast("설정을 저장했어요.");
       go("#/");

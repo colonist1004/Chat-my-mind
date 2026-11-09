@@ -61,6 +61,14 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 `);
 
+// ---- 스키마 업데이트 (기존 DB 에 새 컬럼 추가) ----
+function addColumn(table, column, def) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${def}`);
+}
+addColumn("messages", "speaker", "TEXT"); // 이 메시지를 보낸 내 프로필(페르소나) id
+addColumn("chats", "persona_id", "TEXT"); // 이 대화에서 마지막으로 선택한 프로필
+
 export const uid = () => Date.now().toString(36) + randomBytes(6).toString("hex");
 
 export function tx(fn) {
