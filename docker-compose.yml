@@ -1,0 +1,29 @@
+# 서버에서: cp .env.example .env → .env 수정 → docker compose up -d --build
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - appdata:/data # 데이터베이스 (컨테이너를 지워도 유지)
+
+  # HTTPS 인증서를 자동으로 발급·갱신하는 웹 서버
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?.env 에 DOMAIN 을 설정하세요}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  appdata:
+  caddy_data:
+  caddy_config:

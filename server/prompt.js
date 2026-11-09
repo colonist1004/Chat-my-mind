@@ -11,7 +11,7 @@ const LENGTH_GUIDE = {
   길게: "Write rich, detailed replies: 3–6 paragraphs with vivid narration, inner thoughts and dialogue.",
 };
 
-export function buildSystemPrompt(char, settings, chat) {
+export function buildSystemPrompt(char, settings) {
   const f = (t) => fill(t, char, settings);
   const sec = (title, body) => (body && body.trim() ? `<${title}>\n${f(body).trim()}\n</${title}>\n\n` : "");
 

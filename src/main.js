@@ -1,18 +1,16 @@
 import "./style.css";
-import Anthropic from "@anthropic-ai/sdk";
-import * as db from "./store.js";
-import { MODELS, streamReply, friendlyError, fill } from "./ai.js";
+import { api, streamReply } from "./store.js";
 import { SAMPLE_CHARACTERS } from "./samples.js";
 
 const app = document.getElementById("app");
-let settings;
+let me = null; // { username, isAdmin, settings, models, usage }
 let current = null; // 스트리밍 중인 요청 { abort }
 
 // ---------- 유틸 ----------
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-// *행동* → 기울임, "대사" 강조, 줄바꿈 유지
+// *행동* → 기울임, **강조**, 줄바꿈 유지
 function renderText(text) {
   return esc(text)
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
@@ -34,11 +32,9 @@ function toast(msg) {
   setTimeout(() => t.remove(), 2600);
 }
 
-function go(hash) {
-  location.hash = hash;
-}
+const go = (hash) => (location.hash = hash);
 
-// 이미지를 정사각형 256px JPEG 로 줄여서 저장 용량을 아낍니다.
+// 이미지를 정사각형 256px JPEG 로 줄여 용량을 아낍니다.
 function resizeImage(file, size = 256) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -73,10 +69,54 @@ function pickFile(accept) {
   });
 }
 
+// ---------- 로그인 / 가입 ----------
+async function viewLogin(mode = "login") {
+  const cfg = await api.config().catch(() => ({ signup: true, inviteRequired: false }));
+  const isSignup = mode === "signup";
+  app.innerHTML = `
+    <div class="auth">
+      <form class="auth-card" id="authForm">
+        <div class="auth-logo">💬</div>
+        <h1>Chat My Mind</h1>
+        <p class="hint center">나만의 캐릭터를 만들고 AI와 대화하세요</p>
+        <label class="field"><span>아이디</span><input name="username" autocomplete="username" required></label>
+        <label class="field"><span>비밀번호${isSignup ? " (8자 이상)" : ""}</span>
+          <input name="password" type="password" autocomplete="${isSignup ? "new-password" : "current-password"}" required></label>
+        ${isSignup && cfg.inviteRequired ? `<label class="field"><span>초대 코드</span><input name="inviteCode" required></label>` : ""}
+        <button class="btn primary block" type="submit">${isSignup ? "가입하기" : "로그인"}</button>
+        ${
+          cfg.signup
+            ? `<button class="btn ghost block" type="button" id="switch">${isSignup ? "이미 계정이 있어요 · 로그인" : "처음이에요 · 회원가입"}</button>`
+            : ""
+        }
+      </form>
+    </div>`;
+  const form = app.querySelector("#authForm");
+  app.querySelector("#switch")?.addEventListener("click", () => viewLogin(isSignup ? "login" : "signup"));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { username: form.username.value, password: form.password.value, inviteCode: form.inviteCode?.value };
+    try {
+      await (isSignup ? api.register(body) : api.login(body));
+      me = await api.me();
+      if (location.hash === "" || location.hash === "#/") route();
+      else go("#/");
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+}
+// 사용 중 세션이 만료된 경우에만 로그인 화면으로 (첫 로딩 때는 라우터가 처리)
+window.addEventListener("auth-required", () => {
+  if (!me) return;
+  me = null;
+  viewLogin();
+});
+
 // ---------- 레이아웃 ----------
 // PC: 왼쪽 캐릭터 목록 + 오른쪽 화면 / 모바일: 한 번에 한 화면
-async function shell(mainHTML, { view, activeChar } = {}) {
-  const chars = await db.listCharacters();
+async function shell(mainHTML, { view, activeChar, chars } = {}) {
+  chars = chars || (await api.listCharacters());
   app.innerHTML = `
     <div class="layout view-${view}">
       <aside class="sidebar">
@@ -96,6 +136,7 @@ async function shell(mainHTML, { view, activeChar } = {}) {
             )
             .join("")}
         </div>
+        <div class="side-foot">${esc(me.username)} 님</div>
       </aside>
       <main class="main">${mainHTML}</main>
     </div>`;
@@ -104,7 +145,7 @@ async function shell(mainHTML, { view, activeChar } = {}) {
 
 // ---------- 홈 ----------
 async function viewHome() {
-  const chars = await db.listCharacters();
+  const chars = await api.listCharacters();
   const main = await shell(
     `
     <header class="topbar">
@@ -114,11 +155,6 @@ async function viewHome() {
       <a href="#/settings" class="icon-btn" title="설정">⚙️</a>
     </header>
     <div class="scroll">
-      ${
-        !settings.apiKey
-          ? `<div class="notice">시작하려면 <a href="#/settings">설정</a>에서 Claude API 키를 입력하세요.</div>`
-          : ""
-      }
       <div class="grid">
         <a href="#/new" class="card new-card"><div class="plus">＋</div><b>새 캐릭터</b><span>성격·말투·세계관을 마음대로</span></a>
         ${chars
@@ -135,31 +171,24 @@ async function viewHome() {
           )
           .join("")}
       </div>
-      ${
-        chars.length === 0
-          ? `<div class="empty">아직 캐릭터가 없어요.<br><button class="btn" id="samples">예시 캐릭터 불러오기</button></div>`
-          : ""
-      }
+      ${chars.length === 0 ? `<div class="empty">아직 캐릭터가 없어요.<br><button class="btn" id="samples">예시 캐릭터 불러오기</button></div>` : ""}
     </div>`,
-    { view: "home" },
+    { view: "home", chars },
   );
 
   main.querySelector("#samples")?.addEventListener("click", async () => {
-    for (const s of SAMPLE_CHARACTERS) await db.saveCharacter({ ...db.blankCharacter(), ...s, id: db.uid() });
+    for (const s of SAMPLE_CHARACTERS) await api.createCharacter(s);
     route();
   });
-  main.querySelector("#import").addEventListener("click", importCharacter);
+  main.querySelector("#import").addEventListener("click", importFile);
 }
 
-async function importCharacter() {
+async function importFile() {
   const f = await pickFile("application/json,.json");
   if (!f) return;
   try {
-    const json = JSON.parse(await f.text());
-    const c = json.character || json;
-    if (!c.name) throw new Error("캐릭터 파일이 아닙니다.");
-    await db.saveCharacter({ ...db.blankCharacter(), ...c, id: db.uid() });
-    toast(`'${c.name}' 캐릭터를 가져왔어요.`);
+    const r = await api.importAll(JSON.parse(await f.text()));
+    toast(`캐릭터 ${r.imported}개를 가져왔어요.`);
     route();
   } catch (e) {
     toast("가져오기 실패: " + e.message);
@@ -180,8 +209,7 @@ const FIELDS = [
 
 async function viewEdit(id) {
   const isNew = !id;
-  const c = isNew ? db.blankCharacter() : await db.getCharacter(id);
-  if (!c) return go("#/");
+  const c = isNew ? { emoji: "🙂", tags: [] } : await api.getCharacter(id);
 
   const main = await shell(
     `
@@ -229,7 +257,7 @@ async function viewEdit(id) {
   );
 
   const form = main.querySelector("#form");
-  let avatar = c.avatar;
+  let avatar = c.avatar || "";
   const refreshPreview = () => {
     main.querySelector("#avatarPreview").innerHTML = avatarHTML({ avatar, emoji: form.emoji.value }, "lg");
   };
@@ -246,48 +274,44 @@ async function viewEdit(id) {
     refreshPreview();
   });
 
-  main.querySelector("#save").addEventListener("click", async () => {
-    if (!form.name.value.trim()) {
+  const collect = () => {
+    const data = { emoji: form.emoji.value || "🙂", avatar, tags: form.tags.value.split(",").map((t) => t.trim()).filter(Boolean) };
+    for (const [k] of FIELDS) data[k] = form[k].value;
+    data.name = data.name.trim();
+    return data;
+  };
+
+  main.querySelector("#save").addEventListener("click", async (e) => {
+    const data = collect();
+    if (!data.name) {
       form.name.focus();
       return toast("이름을 입력하세요.");
     }
-    for (const [k] of FIELDS) c[k] = form[k].value;
-    c.name = c.name.trim();
-    c.emoji = form.emoji.value || "🙂";
-    c.avatar = avatar;
-    c.tags = form.tags.value.split(",").map((t) => t.trim()).filter(Boolean);
-    await db.saveCharacter(c);
-    toast("저장했어요.");
-    location.replace("#/chat/" + c.id);
+    e.target.disabled = true;
+    try {
+      const saved = isNew ? await api.createCharacter(data) : await api.updateCharacter(c.id, data);
+      toast("저장했어요.");
+      location.replace("#/chat/" + saved.id);
+    } catch (err) {
+      toast(err.message);
+      e.target.disabled = false;
+    }
   });
 
   main.querySelector("#export")?.addEventListener("click", () => {
-    const { id: _id, lastChatAt: _l, ...rest } = c;
+    const { id: _i, updatedAt: _u, lastChatAt: _l, ...rest } = c;
     download(`${c.name || "character"}.json`, { app: "chat-my-mind", character: rest });
   });
   main.querySelector("#delete")?.addEventListener("click", async () => {
     if (!confirm(`'${c.name}' 캐릭터와 모든 대화를 삭제할까요?`)) return;
-    await db.deleteCharacter(c.id);
+    await api.deleteCharacter(c.id);
     go("#/");
   });
 }
 
 // ---------- 채팅 ----------
-function newChat(c) {
-  const chat = { id: db.uid(), charId: c.id, title: "", note: "", messages: [], createdAt: Date.now() };
-  if (c.greeting?.trim()) chat.messages.push({ id: db.uid(), role: "assistant", text: fill(c.greeting, c, settings), at: Date.now() });
-  return chat;
-}
-
 async function viewChat(charId, chatId) {
-  const c = await db.getCharacter(charId);
-  if (!c) return go("#/");
-
-  let chat = chatId ? await db.getChat(chatId) : (await db.listChats(charId))[0];
-  if (!chat) {
-    chat = newChat(c);
-    await db.saveChat(chat);
-  }
+  const [c, chat] = await Promise.all([api.getCharacter(charId), chatId ? api.getChat(chatId) : api.latestChat(charId)]);
 
   const main = await shell(
     `
@@ -318,12 +342,13 @@ async function viewChat(charId, chatId) {
   const sendBtn = main.querySelector("#send");
   const menu = main.querySelector("#menu");
 
-  const save = () => db.saveChat(chat);
   const atBottom = () => msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 80;
   const scrollDown = () => (msgsEl.scrollTop = msgsEl.scrollHeight);
 
   function msgHTML(m, i) {
-    const isLastAI = m.role === "assistant" && i === chat.messages.length - 1 && chat.messages.some((x) => x.role === "user");
+    const last = i === chat.messages.length - 1;
+    const canRegen = m.role === "assistant" && last && !m.pending && !m.error && chat.messages.some((x) => x.role === "user");
+    const saved = m.id && !m.pending && !m.error;
     return `
       <div class="msg ${m.role}" data-i="${i}">
         ${m.role === "assistant" ? avatarHTML(c, "xs") : ""}
@@ -331,8 +356,8 @@ async function viewChat(charId, chatId) {
           ${m.role === "assistant" ? `<div class="who">${esc(c.name)}</div>` : ""}
           <div class="bubble ${m.error ? "error" : ""}">${m.text ? renderText(m.text) : '<span class="typing"><i></i><i></i><i></i></span>'}</div>
           <div class="msg-actions">
-            ${isLastAI && !m.pending ? `<button data-act="regen" title="다시 생성">↻ 다시</button>` : ""}
-            ${!m.pending ? `<button data-act="edit" title="수정">✎ 수정</button><button data-act="del" title="삭제">✕ 삭제</button>` : ""}
+            ${canRegen ? `<button data-act="regen" title="다시 생성">↻ 다시</button>` : ""}
+            ${saved ? `<button data-act="edit" title="수정">✎ 수정</button><button data-act="del" title="삭제">✕ 삭제</button>` : ""}
           </div>
         </div>
       </div>`;
@@ -351,72 +376,63 @@ async function viewChat(charId, chatId) {
     sendBtn.classList.toggle("stop", b);
   }
 
-  async function generate() {
-    if (!settings.apiKey) {
-      toast("설정에서 API 키를 먼저 입력하세요.");
-      return go("#/settings");
-    }
-    const history = chat.messages.filter((m) => !m.error && m.text);
-    if (!history.some((m) => m.role === "user")) return;
-
-    const reply = { id: db.uid(), role: "assistant", text: "", at: Date.now(), pending: true };
+  async function generate(body, optimisticUser) {
+    chat.messages = chat.messages.filter((m) => !m.error);
+    if (optimisticUser) chat.messages.push(optimisticUser);
+    const reply = { role: "assistant", text: "", pending: true };
     chat.messages.push(reply);
     render();
     setBusy(true);
 
-    const bubble = () => msgsEl.querySelector(`.msg[data-i="${chat.messages.length - 1}"] .bubble`);
-    const req = streamReply({
-      char: c,
-      chat,
-      settings,
-      history,
-      onText: (t) => {
-        reply.text = t;
+    const bubble = () => msgsEl.querySelector(`.msg[data-i="${chat.messages.indexOf(reply)}"] .bubble`);
+    const req = streamReply(chat.id, body, (ev) => {
+      if (ev.type === "user") Object.assign(optimisticUser, ev.message);
+      else if (ev.type === "delta") {
+        reply.text += ev.text;
         const stick = atBottom();
         const b = bubble();
-        if (b) b.innerHTML = renderText(t);
+        if (b) b.innerHTML = renderText(reply.text);
         if (stick) scrollDown();
-      },
+      } else if (ev.type === "done") {
+        Object.assign(reply, ev.message);
+        if (ev.truncated) toast("답변이 최대 길이에 도달해 잘렸어요. 설정에서 최대 토큰을 늘릴 수 있어요.");
+      } else if (ev.type === "error") {
+        reply.text = ev.error;
+        reply.error = true;
+      }
     });
     current = req;
     try {
-      const r = await req.done;
-      reply.text = r.text;
-      if (r.refused) {
-        reply.text = "이 요청에는 답변할 수 없었어요. 내용을 바꿔 다시 시도해 주세요.";
-        reply.error = true;
-      } else if (r.truncated) toast("답변이 최대 길이에 도달해 잘렸어요. 설정에서 최대 토큰을 늘릴 수 있어요.");
+      await req.done;
     } catch (e) {
-      if (e instanceof Anthropic.APIUserAbortError) {
-        if (!reply.text) chat.messages.pop();
-      } else {
-        reply.text = friendlyError(e);
+      if (e.name !== "AbortError") {
+        if (optimisticUser && !optimisticUser.id) chat.messages.splice(chat.messages.indexOf(optimisticUser), 1);
+        reply.text = e.message;
         reply.error = true;
       }
     } finally {
-      delete reply.pending;
       current = null;
       setBusy(false);
+      delete reply.pending;
+      // 멈춘 경우 등은 서버에 저장된 상태와 맞추기 위해 다시 불러옵니다.
+      if (!reply.id && !reply.error) {
+        await new Promise((r) => setTimeout(r, 300));
+        const fresh = await api.getChat(chat.id).catch(() => null);
+        if (fresh) chat.messages = fresh.messages;
+      }
       chat.messages = chat.messages.filter((m) => m.text);
-      if (!chat.title) chat.title = (chat.messages.find((m) => m.role === "user")?.text || "").slice(0, 30);
-      await save();
-      await db.touchCharacter(c.id);
       render();
     }
   }
 
-  main.querySelector("#composer").addEventListener("submit", async (e) => {
+  main.querySelector("#composer").addEventListener("submit", (e) => {
     e.preventDefault();
     if (current) return current.abort();
     const text = input.value.trim();
     if (!text) return;
-    // 이전 오류 메시지는 지우고 진행
-    chat.messages = chat.messages.filter((m) => !m.error);
-    chat.messages.push({ id: db.uid(), role: "user", text, at: Date.now() });
     input.value = "";
     autosize();
-    await save();
-    generate();
+    generate({ text }, { role: "user", text });
   });
 
   // PC: Enter 전송, Shift+Enter 줄바꿈 / 모바일: 엔터는 줄바꿈, 버튼으로 전송
@@ -439,31 +455,38 @@ async function viewChat(charId, chatId) {
     const i = Number(btn.closest(".msg").dataset.i);
     const m = chat.messages[i];
     const act = btn.dataset.act;
-    if (act === "regen") {
-      chat.messages.splice(i, 1);
-      generate();
-    } else if (act === "del") {
-      chat.messages.splice(i, 1);
-      await save();
-      render();
-    } else if (act === "edit") {
-      const bubbleEl = btn.closest(".bubble-wrap").querySelector(".bubble");
-      bubbleEl.innerHTML = `<textarea class="edit-area">${esc(m.text)}</textarea>
-        <div class="edit-actions"><button class="btn ghost" data-e="cancel">취소</button><button class="btn primary" data-e="ok">저장</button></div>`;
-      const ta = bubbleEl.querySelector("textarea");
-      ta.style.height = Math.max(ta.scrollHeight, 80) + "px";
-      ta.focus();
-      bubbleEl.addEventListener("click", async (ev) => {
-        const b = ev.target.closest("button[data-e]");
-        if (!b) return;
-        ev.stopPropagation();
-        if (b.dataset.e === "ok" && ta.value.trim()) {
-          m.text = ta.value.trim();
-          delete m.error;
-          await save();
-        }
+    try {
+      if (act === "regen") {
+        chat.messages.splice(i, 1);
+        generate({ regenerate: true });
+      } else if (act === "del") {
+        await api.deleteMessage(chat.id, m.id);
+        chat.messages.splice(i, 1);
         render();
-      });
+      } else if (act === "edit") {
+        const bubbleEl = btn.closest(".bubble-wrap").querySelector(".bubble");
+        bubbleEl.innerHTML = `<textarea class="edit-area">${esc(m.text)}</textarea>
+          <div class="edit-actions"><button class="btn ghost" data-e="cancel">취소</button><button class="btn primary" data-e="ok">저장</button></div>`;
+        const ta = bubbleEl.querySelector("textarea");
+        ta.style.height = Math.max(ta.scrollHeight, 80) + "px";
+        ta.focus();
+        bubbleEl.addEventListener("click", async (ev) => {
+          const b = ev.target.closest("button[data-e]");
+          if (!b) return;
+          ev.stopPropagation();
+          try {
+            if (b.dataset.e === "ok" && ta.value.trim()) {
+              await api.editMessage(chat.id, m.id, ta.value.trim());
+              m.text = ta.value.trim();
+            }
+          } catch (err) {
+            toast(err.message);
+          }
+          render();
+        });
+      }
+    } catch (err) {
+      toast(err.message);
     }
   });
 
@@ -472,23 +495,27 @@ async function viewChat(charId, chatId) {
     e.stopPropagation();
     menu.hidden = !menu.hidden;
   });
-  document.addEventListener("click", () => (menu.hidden = true), { once: true });
+  main.addEventListener("click", () => (menu.hidden = true));
   menu.addEventListener("click", async (e) => {
     const act = e.target.closest("button")?.dataset.act;
     menu.hidden = true;
-    if (current && act !== "edit") current.abort();
-    if (act === "new") {
-      const nc = newChat(c);
-      await db.saveChat(nc);
-      go(`#/chat/${c.id}/${nc.id}`);
-    } else if (act === "chats") showChatList(c, chat);
-    else if (act === "note") showNote();
-    else if (act === "edit") go("#/edit/" + c.id);
-    else if (act === "clear") {
-      if (!confirm("이 대화를 삭제할까요?")) return;
-      await db.deleteChat(chat);
-      const target = "#/chat/" + c.id;
-      location.hash === target ? route() : go(target);
+    try {
+      if (act === "new") {
+        current?.abort();
+        const nc = await api.newChat(c.id);
+        go(`#/chat/${c.id}/${nc.id}`);
+      } else if (act === "chats") await showChatList(c, chat);
+      else if (act === "note") showNote();
+      else if (act === "edit") go("#/edit/" + c.id);
+      else if (act === "clear") {
+        if (!confirm("이 대화를 삭제할까요?")) return;
+        current?.abort();
+        await api.deleteChat(chat.id);
+        const target = "#/chat/" + c.id;
+        location.hash === target ? route() : go(target);
+      }
+    } catch (err) {
+      toast(err.message);
     }
   });
 
@@ -498,8 +525,9 @@ async function viewChat(charId, chatId) {
        <p class="hint">캐릭터가 이 대화에서 항상 기억해야 할 내용을 적어 두세요. (예: 둘은 이미 사귀는 사이, 지금은 여름방학)</p>
        <textarea id="noteText" rows="6">${esc(chat.note)}</textarea>`,
       async (root) => {
-        chat.note = root.querySelector("#noteText").value;
-        await save();
+        const note = root.querySelector("#noteText").value;
+        await api.updateChat(chat.id, { note });
+        chat.note = note;
         toast("유저 노트를 저장했어요.");
       },
     );
@@ -510,7 +538,7 @@ async function viewChat(charId, chatId) {
 }
 
 async function showChatList(c, active) {
-  const chats = await db.listChats(c.id);
+  const chats = await api.listChats(c.id);
   const root = modal(
     `<h2>🗂 ${esc(c.name)}와의 대화</h2>
      <div class="chat-list">
@@ -518,7 +546,7 @@ async function showChatList(c, active) {
          .map(
            (ch) => `<a href="#/chat/${c.id}/${ch.id}" class="chat-row ${ch.id === active.id ? "active" : ""}">
               <b>${esc(ch.title || "새 대화")}</b>
-              <span>${new Date(ch.updatedAt).toLocaleString("ko-KR")} · 메시지 ${ch.messages.length}개</span>
+              <span>${new Date(ch.updatedAt).toLocaleString("ko-KR")} · 메시지 ${ch.messageCount}개</span>
             </a>`,
          )
          .join("")}
@@ -538,8 +566,12 @@ function modal(inner, onOk) {
   root.addEventListener("click", async (e) => {
     if (e.target === root || e.target.dataset.m === "close") root.remove();
     if (e.target.dataset.m === "ok") {
-      await onOk(root);
-      root.remove();
+      try {
+        await onOk(root);
+        root.remove();
+      } catch (err) {
+        toast(err.message);
+      }
     }
   });
   document.body.appendChild(root);
@@ -548,7 +580,9 @@ function modal(inner, onOk) {
 
 // ---------- 설정 ----------
 async function viewSettings() {
-  const s = settings;
+  me = await api.me();
+  const s = me.settings;
+  const usage = me.usage.limit ? `오늘 ${me.usage.today} / ${me.usage.limit}회 사용` : `오늘 ${me.usage.today}회 사용 (무제한)`;
   const main = await shell(
     `
     <header class="topbar">
@@ -559,15 +593,20 @@ async function viewSettings() {
     </header>
     <div class="scroll">
       <form class="form" id="form" onsubmit="return false">
-        <h3>AI 연결</h3>
-        <label class="field"><span>Claude API 키</span>
-          <input name="apiKey" type="password" autocomplete="off" value="${esc(s.apiKey)}" placeholder="sk-ant-...">
-        </label>
-        <p class="hint">키는 <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">Claude Console</a>에서 발급받을 수 있어요. 키는 이 기기에만 저장되고 Anthropic API 외에는 어디에도 전송되지 않습니다.</p>
+        <h3>계정</h3>
+        <div class="account">
+          <div><b>${esc(me.username)}</b>${me.isAdmin ? ' <i class="badge">관리자</i>' : ""}<br><span class="hint">${usage}</span></div>
+          <div class="row">
+            <button type="button" class="btn" id="pw">비밀번호 변경</button>
+            <button type="button" class="btn ghost" id="logout">로그아웃</button>
+          </div>
+        </div>
+
+        <h3>AI</h3>
         <label class="field"><span>모델</span>
-          <select name="model">${MODELS.map((m) => `<option value="${m.id}" ${m.id === s.model ? "selected" : ""}>${m.label}</option>`).join("")}</select>
+          <select name="model">${me.models.map((m) => `<option value="${m.id}" ${m.id === s.model ? "selected" : ""}>${m.label}</option>`).join("")}</select>
         </label>
-        <label class="field"><span>사고 깊이 (effort)</span>
+        <label class="field"><span>사고 깊이</span>
           <select name="effort">
             ${[
               ["low", "낮음 – 빠른 답변"],
@@ -582,7 +621,7 @@ async function viewSettings() {
           <select name="length">${["짧게", "보통", "길게"].map((v) => `<option ${v === s.length ? "selected" : ""}>${v}</option>`).join("")}</select>
         </label>
         <label class="field"><span>최대 토큰 (답변 상한)</span>
-          <input name="maxTokens" type="number" min="500" max="64000" step="500" value="${esc(s.maxTokens)}">
+          <input name="maxTokens" type="number" min="500" max="32000" step="500" value="${esc(s.maxTokens)}">
         </label>
 
         <h3>내 프로필 (페르소나)</h3>
@@ -592,10 +631,10 @@ async function viewSettings() {
         </label>
 
         <h3>데이터</h3>
-        <p class="hint">캐릭터와 대화는 모두 이 기기(브라우저)에만 저장됩니다. 다른 기기로 옮기려면 백업 파일을 사용하세요.</p>
+        <p class="hint">캐릭터와 대화는 서버에 저장되어 어느 기기에서 로그인해도 이어서 볼 수 있어요.</p>
         <div class="row">
           <button type="button" class="btn" id="backup">전체 백업 내보내기</button>
-          <button type="button" class="btn" id="restore">백업 불러오기</button>
+          <button type="button" class="btn" id="restore">백업/캐릭터 불러오기</button>
         </div>
       </form>
     </div>`,
@@ -604,34 +643,42 @@ async function viewSettings() {
 
   const form = main.querySelector("#form");
   main.querySelector("#save").addEventListener("click", async () => {
-    settings = {
-      ...settings,
-      apiKey: form.apiKey.value.trim(),
-      model: form.model.value,
-      effort: form.effort.value,
-      length: form.length.value,
-      maxTokens: Math.max(500, Number(form.maxTokens.value) || 4000),
-      userName: form.userName.value.trim() || "나",
-      userPersona: form.userPersona.value,
-    };
-    await db.saveSettings(settings);
-    toast("설정을 저장했어요.");
-    history.length > 1 ? history.back() : go("#/");
-  });
-  main.querySelector("#backup").addEventListener("click", async () => {
-    download(`chat-my-mind-backup-${new Date().toISOString().slice(0, 10)}.json`, await db.exportAll());
-  });
-  main.querySelector("#restore").addEventListener("click", async () => {
-    const f = await pickFile("application/json,.json");
-    if (!f) return;
     try {
-      await db.importAll(JSON.parse(await f.text()));
-      toast("백업을 불러왔어요.");
+      me.settings = await api.saveSettings({
+        model: form.model.value,
+        effort: form.effort.value,
+        length: form.length.value,
+        maxTokens: Number(form.maxTokens.value),
+        userName: form.userName.value,
+        userPersona: form.userPersona.value,
+      });
+      toast("설정을 저장했어요.");
       go("#/");
     } catch (e) {
-      toast("불러오기 실패: " + e.message);
+      toast(e.message);
     }
   });
+  main.querySelector("#logout").addEventListener("click", async () => {
+    await api.logout().catch(() => {});
+    me = null;
+    history.replaceState(null, "", location.pathname);
+    viewLogin();
+  });
+  main.querySelector("#pw").addEventListener("click", () =>
+    modal(
+      `<h2>비밀번호 변경</h2>
+       <label class="field"><span>현재 비밀번호</span><input id="pwCur" type="password" autocomplete="current-password"></label>
+       <label class="field"><span>새 비밀번호 (8자 이상)</span><input id="pwNext" type="password" autocomplete="new-password"></label>`,
+      async (root) => {
+        await api.changePassword({ current: root.querySelector("#pwCur").value, next: root.querySelector("#pwNext").value });
+        toast("비밀번호를 바꿨어요.");
+      },
+    ),
+  );
+  main.querySelector("#backup").addEventListener("click", async () => {
+    download(`chat-my-mind-backup-${new Date().toISOString().slice(0, 10)}.json`, await api.exportAll());
+  });
+  main.querySelector("#restore").addEventListener("click", importFile);
 }
 
 // ---------- 라우터 ----------
@@ -640,17 +687,24 @@ async function route() {
     current.abort();
     current = null;
   }
+  if (!me) return viewLogin();
   const [, page, a, b] = (location.hash || "#/").split("/");
-  if (page === "chat" && a) return viewChat(a, b);
-  if (page === "edit" && a) return viewEdit(a);
-  if (page === "new") return viewEdit(null);
-  if (page === "settings") return viewSettings();
-  return viewHome();
+  try {
+    if (page === "chat" && a) return await viewChat(a, b);
+    if (page === "edit" && a) return await viewEdit(a);
+    if (page === "new") return await viewEdit(null);
+    if (page === "settings") return await viewSettings();
+    return await viewHome();
+  } catch (e) {
+    if (e.status === 401) return;
+    toast(e.message);
+    if (e.status === 404) go("#/");
+  }
 }
 
 (async function start() {
-  settings = await db.getSettings();
   window.addEventListener("hashchange", route);
+  me = await api.me().catch(() => null);
   await route();
   if ("serviceWorker" in navigator && import.meta.env.PROD) navigator.serviceWorker.register("./sw.js").catch(() => {});
 })();

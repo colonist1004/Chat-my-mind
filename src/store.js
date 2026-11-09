@@ -1,105 +1,89 @@
-// 모든 데이터는 이 기기의 IndexedDB 에만 저장됩니다.
-import { get, set, del, keys } from "idb-keyval";
+// 서버 API 클라이언트. 데이터는 모두 서버(DB)에 저장됩니다.
 
-export const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+export class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
 
-const DEFAULT_SETTINGS = {
-  apiKey: "",
-  model: "claude-opus-5-5",
-  effort: "medium",
-  maxTokens: 4000,
-  length: "보통", // 짧게 | 보통 | 길게
-  userName: "나",
-  userPersona: "",
+async function call(method, path, body) {
+  const res = await fetch("/api" + path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    credentials: "same-origin",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new ApiError(res.status, data.error || `요청 실패 (${res.status})`);
+    if (res.status === 401) window.dispatchEvent(new CustomEvent("auth-required"));
+    throw err;
+  }
+  return data;
+}
+
+export const api = {
+  config: () => call("GET", "/config"),
+  register: (b) => call("POST", "/auth/register", b),
+  login: (b) => call("POST", "/auth/login", b),
+  logout: () => call("POST", "/auth/logout"),
+  changePassword: (b) => call("POST", "/auth/password", b),
+  me: () => call("GET", "/me"),
+  saveSettings: (s) => call("PUT", "/settings", s),
+
+  listCharacters: () => call("GET", "/characters"),
+  getCharacter: (id) => call("GET", "/characters/" + id),
+  createCharacter: (c) => call("POST", "/characters", c),
+  updateCharacter: (id, c) => call("PUT", "/characters/" + id, c),
+  deleteCharacter: (id) => call("DELETE", "/characters/" + id),
+
+  listChats: (charId) => call("GET", `/characters/${charId}/chats`),
+  newChat: (charId) => call("POST", `/characters/${charId}/chats`),
+  latestChat: (charId) => call("GET", `/characters/${charId}/latest-chat`),
+  getChat: (id) => call("GET", "/chats/" + id),
+  updateChat: (id, b) => call("PATCH", "/chats/" + id, b),
+  deleteChat: (id) => call("DELETE", "/chats/" + id),
+  editMessage: (chatId, mid, text) => call("PUT", `/chats/${chatId}/messages/${mid}`, { text }),
+  deleteMessage: (chatId, mid) => call("DELETE", `/chats/${chatId}/messages/${mid}`),
+
+  exportAll: () => call("GET", "/export"),
+  importAll: (json) => call("POST", "/import", json),
 };
 
-export async function getSettings() {
-  return { ...DEFAULT_SETTINGS, ...((await get("settings")) || {}) };
-}
-export async function saveSettings(s) {
-  await set("settings", s);
-}
-
-// ---- 캐릭터 ----
-export function blankCharacter() {
-  return {
-    id: uid(),
-    name: "",
-    avatar: "", // dataURL 또는 비어 있으면 이모지
-    emoji: "🙂",
-    tagline: "",
-    personality: "",
-    speech: "",
-    background: "",
-    scenario: "",
-    greeting: "",
-    examples: "",
-    tags: [],
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  };
-}
-
-export async function listCharacters() {
-  const ids = (await get("characters")) || [];
-  const list = await Promise.all(ids.map((id) => get("char:" + id)));
-  return list.filter(Boolean).sort((a, b) => (b.lastChatAt || b.updatedAt) - (a.lastChatAt || a.updatedAt));
-}
-export const getCharacter = (id) => get("char:" + id);
-export async function saveCharacter(c) {
-  c.updatedAt = Date.now();
-  await set("char:" + c.id, c);
-  const ids = (await get("characters")) || [];
-  if (!ids.includes(c.id)) await set("characters", [...ids, c.id]);
-}
-export async function touchCharacter(id) {
-  const c = await getCharacter(id);
-  if (c) {
-    c.lastChatAt = Date.now();
-    await set("char:" + id, c);
-  }
-}
-export async function deleteCharacter(id) {
-  for (const chat of await listChats(id)) await del("chat:" + chat.id);
-  await del("chats:" + id);
-  await del("char:" + id);
-  const ids = (await get("characters")) || [];
-  await set("characters", ids.filter((x) => x !== id));
-}
-
-// ---- 대화 ----
-// chat = { id, charId, title, note, messages: [{id, role:'user'|'assistant', text, at}] }
-export async function listChats(charId) {
-  const ids = (await get("chats:" + charId)) || [];
-  const list = await Promise.all(ids.map((id) => get("chat:" + id)));
-  return list.filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt);
-}
-export const getChat = (id) => get("chat:" + id);
-export async function saveChat(chat) {
-  chat.updatedAt = Date.now();
-  await set("chat:" + chat.id, chat);
-  const ids = (await get("chats:" + chat.charId)) || [];
-  if (!ids.includes(chat.id)) await set("chats:" + chat.charId, [...ids, chat.id]);
-}
-export async function deleteChat(chat) {
-  await del("chat:" + chat.id);
-  const ids = (await get("chats:" + chat.charId)) || [];
-  await set("chats:" + chat.charId, ids.filter((x) => x !== chat.id));
-}
-
-// ---- 백업 ----
-export async function exportAll() {
-  const data = {};
-  for (const k of await keys()) if (k !== "settings") data[k] = await get(k);
-  return { app: "chat-my-mind", version: 1, exportedAt: new Date().toISOString(), data };
-}
-export async function importAll(json) {
-  if (json?.app !== "chat-my-mind" || !json.data) throw new Error("Chat My Mind 백업 파일이 아닙니다.");
-  // 목록 키는 합쳐서 기존 데이터가 지워지지 않게 합니다.
-  for (const [k, v] of Object.entries(json.data)) {
-    if (k === "characters" || k.startsWith("chats:")) {
-      const cur = (await get(k)) || [];
-      await set(k, [...new Set([...cur, ...v])]);
-    } else await set(k, v);
-  }
+/**
+ * AI 답변 스트리밍. body = { text } 또는 { regenerate: true }
+ * 서버가 보내는 이벤트: user(저장된 내 메시지), delta(글자), done(저장된 답변), error
+ */
+export function streamReply(chatId, body, onEvent) {
+  const ctrl = new AbortController();
+  const done = (async () => {
+    const res = await fetch(`/api/chats/${chatId}/reply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+      credentials: "same-origin",
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) window.dispatchEvent(new CustomEvent("auth-required"));
+      throw new ApiError(res.status, data.error || `요청 실패 (${res.status})`);
+    }
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+        if (line) onEvent(JSON.parse(line.slice(6)));
+      }
+    }
+  })();
+  return { abort: () => ctrl.abort(), done };
 }
